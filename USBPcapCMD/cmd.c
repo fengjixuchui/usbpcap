@@ -1,33 +1,13 @@
 /*
  * Copyright (c) 2013-2018 Tomasz Moń <desowin@gmail.com>
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #define _CRT_SECURE_NO_DEPRECATE
 
 #include <initguid.h>
 #include <windows.h>
-#include <winioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <Shellapi.h>
@@ -39,10 +19,13 @@
 #include "getopt.h"
 #include "roothubs.h"
 #include "version.h"
+#include "descriptors.h"
+#include "USBPcap.h"
 
 #define INPUT_BUFFER_SIZE 1024
 
 #define DEFAULT_INTERNAL_KERNEL_BUFFER_SIZE (1024*1024)
+#define DEFAULT_SNAPSHOT_LENGTH             (65535)
 
 static BOOL IsElevated()
 {
@@ -358,21 +341,26 @@ static BOOL generate_worker_command_line(struct thread_data *data,
         *pcap_handle = INVALID_HANDLE_VALUE;
     }
 
-#define WORKER_CMD_LINE_FORMATTER             L"-d %S -b %d -o %S"
-#define WORKER_CMD_LINE_FORMATTER_PIPE        L"-d %S -b %d -o %s"
+#define WORKER_CMD_LINE_FORMATTER             L"-d %S -b %u -o %S"
+#define WORKER_CMD_LINE_FORMATTER_PIPE        L"-d %S -b %u -o %s"
 
+#define WORKER_CMD_LINE_FORMATTER_SNAPLEN     L" -s %u"
 #define WORKER_CMD_LINE_FORMATTER_DEVICES     L" --devices %S"
 #define WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL L" --capture-from-all-devices"
 #define WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW L" --capture-from-new-devices"
+#define WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS L" --inject-descriptors"
 
     cmdLineLen = MultiByteToWideChar(CP_ACP, 0, data->device, -1, NULL, 0);
     cmdLineLen += (pipeName == NULL) ? strlen(data->filename) : wcslen(pipeName);
     cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER);
     cmdLineLen += 9 /* maximum bufferlen in characters */;
     cmdLineLen += 1 /* NULL termination */;
+    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_SNAPLEN);
+    cmdLineLen += 10 /* maximum snaplen in characters */;
     cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_DEVICES);
     cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL);
     cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW);
+    cmdLineLen += wcslen(WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS);
     cmdLineLen += (data->address_list == NULL) ? 0 : strlen(data->address_list);
 
     cmdLine = (PWSTR)malloc(cmdLineLen * sizeof(WCHAR));
@@ -404,6 +392,14 @@ static BOOL generate_worker_command_line(struct thread_data *data,
                             pipeName);
     }
 
+    if (data->snaplen != DEFAULT_SNAPSHOT_LENGTH)
+    {
+        nChars += swprintf_s(&cmdLine[nChars],
+                             cmdLineLen - nChars,
+                             WORKER_CMD_LINE_FORMATTER_SNAPLEN,
+                             data->snaplen);
+    }
+
     if (data->address_list != NULL)
     {
         nChars += swprintf_s(&cmdLine[nChars],
@@ -425,12 +421,21 @@ static BOOL generate_worker_command_line(struct thread_data *data,
                              cmdLineLen - nChars,
                              WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW);
     }
+
+    if (data->inject_descriptors)
+    {
+        nChars += swprintf_s(&cmdLine[nChars],
+                             cmdLineLen - nChars,
+                             WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS);
+    }
 #undef WORKER_CMD_LINE_FORMATTER_PIPE
 #undef WORKER_CMD_LINE_FORMATTER
 
+#undef WORKER_CMD_LINE_FORMATTER_INJECT_DESCRIPTORS
 #undef WORKER_CMD_LINE_FORMATTER_CAPTURE_NEW
 #undef WORKER_CMD_LINE_FORMATTER_CAPTURE_ALL
 #undef WORKER_CMD_LINE_FORMATTER_DEVICES
+#undef WORKER_CMD_LINE_FORMATTER_SNAPLEN
 
     free(pipeName);
 
@@ -567,7 +572,6 @@ int cmd_interactive(struct thread_data *data)
 {
     int i = 0;
     int max_i;
-    char *filename;
     char buffer[INPUT_BUFFER_SIZE];
     BOOL finished;
     BOOL exit = FALSE;
@@ -604,6 +608,7 @@ int cmd_interactive(struct thread_data *data)
 
     data->filename = NULL;
     data->capture_all = TRUE;
+    data->inject_descriptors = TRUE;
 
     filters_initialize();
     if (usbpcapFilters[0] == NULL)
@@ -654,7 +659,7 @@ int cmd_interactive(struct thread_data *data)
     while (usbpcapFilters[i] != NULL)
     {
         printf("%d %s\n", i+1, usbpcapFilters[i]->device);
-        enumerate_attached_devices(usbpcapFilters[i]->device, ENUMERATE_USBPCAPCMD);
+        enumerate_print_usbpcap_interactive(usbpcapFilters[i]->device);
         i++;
     }
 
@@ -836,10 +841,18 @@ static void start_capture(struct thread_data *data)
         return;
     }
 
+    if (FALSE == USBPcapInitAddressFilter(&data->filter, data->address_list, data->capture_all))
+    {
+        fprintf(stderr, "USBPcapInitAddressFilter failed!\n");
+        return;
+    }
+
     data->exit_event = CreateEvent(NULL, /* Handle cannot be inherited */
                                    TRUE, /* Manual Reset */
                                    FALSE, /* Default to not signalled */
                                    NULL);
+
+    memset(&data->descriptors, 0, sizeof(data->descriptors));
 
     if (IsElevated() == TRUE)
     {
@@ -857,6 +870,13 @@ static void start_capture(struct thread_data *data)
                                              CREATE_NEW,
                                              FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED,
                                              NULL);
+        }
+
+        if (data->inject_descriptors)
+        {
+            data->descriptors.descriptors = descriptors_generate_pcap(data->device, &data->descriptors.descriptors_len,
+                                                                      &data->filter);
+            data->descriptors.buf_written = 0;
         }
 
         data->read_handle = create_filter_read_handle(data);
@@ -1088,6 +1108,11 @@ static void start_capture(struct thread_data *data)
         WaitForSingleObject(process, INFINITE);
         CloseHandle(process);
     }
+
+    if (data->descriptors.descriptors)
+    {
+        descriptors_free_pcap(data->descriptors.descriptors);
+    }
 }
 
 static void print_extcap_version(void)
@@ -1134,7 +1159,7 @@ static int print_extcap_options(const char *device)
 
     printf("arg {number=0}{call=--snaplen}"
            "{display=Snapshot length}{tooltip=Snapshot length}"
-           "{type=integer}{range=0,65535}{default=65535}\n");
+           "{type=unsigned}{default=%d}\n", DEFAULT_SNAPSHOT_LENGTH);
     printf("arg {number=1}{call=--bufferlen}"
            "{display=Capture buffer length}"
            "{tooltip=USBPcap kernel-mode capture buffer length in bytes}"
@@ -1148,10 +1173,13 @@ static int print_extcap_options(const char *device)
            "{display=Capture from newly connected devices}"
            "{tooltip=Automatically start capture on all newly connected devices}"
            "{type=boolflag}{default=true}\n");
+    printf("arg {number=4}{call=--inject-descriptors}"
+           "{display=Inject already connected devices descriptors into capture data}"
+           "{type=boolflag}{default=true}\n");
     printf("arg {number=%d}{call=--devices}{display=Attached USB Devices}{tooltip=Select individual devices to capture from}{type=multicheck}\n",
            EXTCAP_ARGNUM_MULTICHECK);
 
-    enumerate_attached_devices(device, ENUMERATE_EXTCAP);
+    enumerate_print_extcap_config(device);
 
     return 0;
 }
@@ -1242,7 +1270,6 @@ static void attach_parent_console()
 {
     HANDLE inHandle, outHandle, errHandle;
     BOOL outRedirected, errRedirected;
-    int outType, errType;
 
     inHandle = GetStdHandle(STD_INPUT_HANDLE);
     outHandle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1315,6 +1342,8 @@ static void print_help(void)
            "  --devices <list>\n"
            "    Captures data only from devices with addresses present in list.\n"
            "    List is comma separated list of values. Example --devices 1,2,3.\n"
+           "  --inject-descriptors\n"
+           "    Inject already connected devices descriptors into capture data.\n"
            "  -I,  --init-non-standard-hwids\n"
            "    Initializes NonStandardHWIDs registry key used by USBPcapDriver.\n"
            "    This registry key is needed for USB 3.0 capture.\n");
@@ -1323,6 +1352,7 @@ static void print_help(void)
 /* Commandline arguments without short option */
 #define ARG_DEVICES                    900
 #define ARG_CAPTURE_FROM_NEW_DEVICES   901
+#define ARG_INJECT_DESCRIPTORS         902
 #define ARG_EXTCAP_VERSION            1000
 #define ARG_EXTCAP_INTERFACES         1001
 #define ARG_EXTCAP_INTERFACE          1002
@@ -1351,6 +1381,7 @@ int __cdecl main(int argc, CHAR **argv)
         {"devices", required_argument, 0, ARG_DEVICES},
         {"capture-from-all-devices", no_argument, 0, 'A'},
         {"capture-from-new-devices", no_argument, 0, ARG_CAPTURE_FROM_NEW_DEVICES},
+        {"inject-descriptors", no_argument, 0, ARG_INJECT_DESCRIPTORS},
         /* Extcap interface. Please note that there are no short
          * options for these and the numbers are just gopt keys.
          */
@@ -1373,7 +1404,8 @@ int __cdecl main(int argc, CHAR **argv)
     data.address_list = NULL;
     data.capture_all = FALSE;
     data.capture_new = FALSE;
-    data.snaplen = 65535;
+    data.inject_descriptors = FALSE;
+    data.snaplen = DEFAULT_SNAPSHOT_LENGTH;
     data.bufferlen = DEFAULT_INTERNAL_KERNEL_BUFFER_SIZE;
     data.job_handle = INVALID_HANDLE_VALUE;
     data.worker_process_thread = INVALID_HANDLE_VALUE;
@@ -1433,6 +1465,9 @@ int __cdecl main(int argc, CHAR **argv)
             case ARG_CAPTURE_FROM_NEW_DEVICES:
                 data.capture_new = TRUE;
                 break;
+            case ARG_INJECT_DESCRIPTORS:
+                data.inject_descriptors = TRUE;
+                break;
             case ARG_EXTCAP_VERSION:
                 do_extcap_version = 1;
                 wireshark_version = optarg;
@@ -1454,6 +1489,12 @@ int __cdecl main(int argc, CHAR **argv)
                 printf("getopt_long() returned character code 0x%X. Please report.\n", c);
                 return -1;
         }
+    }
+
+    if (data.snaplen > (data.bufferlen - sizeof(pcaprec_hdr_t)))
+    {
+        fprintf(stderr, "Packets larger than %u bytes won't be captured due to too small buffer.\n",
+                data.bufferlen - sizeof(pcaprec_hdr_t));
     }
 
     /* Handle extcap options separately from standard USBPcapCMD options. */

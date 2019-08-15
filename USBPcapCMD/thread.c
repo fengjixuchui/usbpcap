@@ -1,26 +1,7 @@
 /*
  * Copyright (c) 2013 Tomasz Moń <desowin@gmail.com>
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
- * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <devioctl.h>
@@ -30,25 +11,18 @@
 #include "USBPcap.h"
 #include "thread.h"
 #include "iocontrol.h"
+#include "descriptors.h"
 
 HANDLE create_filter_read_handle(struct thread_data *data)
 {
     HANDLE filter_handle = INVALID_HANDLE_VALUE;
-    USBPCAP_ADDRESS_FILTER filter;
     char* inBuf = NULL;
     DWORD inBufSize = 0;
     DWORD bytes_ret;
-    DWORD ioctl;
-
-    if (FALSE == USBPcapInitAddressFilter(&filter, data->address_list, data->capture_all))
-    {
-        fprintf(stderr, "USBPcapInitAddressFilter failed!\n");
-        goto finish;
-    }
 
     if (data->capture_new)
     {
-        USBPcapSetDeviceFiltered(&filter, 0);
+        USBPcapSetDeviceFiltered(&data->filter, 0);
     }
 
     filter_handle = CreateFileA(data->device,
@@ -103,8 +77,8 @@ HANDLE create_filter_read_handle(struct thread_data *data)
 
     if (!DeviceIoControl(filter_handle,
                          IOCTL_USBPCAP_START_FILTERING,
-                         (char*)&filter,
-                         sizeof(filter),
+                         (char*)&data->filter,
+                         sizeof(USBPCAP_ADDRESS_FILTER),
                          NULL,
                          0,
                          &bytes_ret,
@@ -131,6 +105,73 @@ finish:
     }
 
     return INVALID_HANDLE_VALUE;
+}
+
+static void write_data(struct thread_data* data, LPOVERLAPPED write_overlapped,
+                       void *buffer, DWORD bytes)
+{
+    /* Write data to the end of the file. */
+    write_overlapped->Offset = 0xFFFFFFFF;
+    write_overlapped->OffsetHigh = 0xFFFFFFFF;
+    if (!WriteFile(data->write_handle, buffer, bytes, NULL, write_overlapped))
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING)
+        {
+            DWORD written;
+            if (!GetOverlappedResult(data->write_handle, write_overlapped, &written, TRUE))
+            {
+                fprintf(stderr, "GetOverlappedResult() on write handle failed: %d\n", GetLastError());
+            }
+            else if (written != bytes)
+            {
+                fprintf(stderr, "Wrote %d bytes instead of %d. Stopping capture.\n", written, bytes);
+                data->process = FALSE;
+            }
+        }
+        else
+        {
+            /* Failed to write to output. Quit. */
+            fprintf(stderr, "Write failed (%d). Stopping capture.\n", err);
+            data->process = FALSE;
+        }
+    }
+    FlushFileBuffers(data->write_handle);
+    ResetEvent(write_overlapped->hEvent);
+}
+
+static void process_data(struct thread_data* data, LPOVERLAPPED write_overlapped,
+                         unsigned char *buffer, DWORD bytes)
+{
+    if (data->descriptors.buf_written < sizeof(pcap_hdr_t))
+    {
+        DWORD to_write = sizeof(pcap_hdr_t) - data->descriptors.buf_written;
+        if (to_write > bytes)
+        {
+            to_write = bytes;
+        }
+        memcpy(&data->descriptors.buf[data->descriptors.buf_written], buffer, to_write);
+        data->descriptors.buf_written += to_write;
+
+        if (data->descriptors.buf_written == sizeof(pcap_hdr_t))
+        {
+            pcap_hdr_t *hdr = (pcap_hdr_t *)data->descriptors.buf;
+            write_data(data, write_overlapped, data->descriptors.buf, sizeof(pcap_hdr_t));
+            if ((hdr->magic_number == 0xA1B2C3D4) && (hdr->network == DLT_USBPCAP) && (data->descriptors.descriptors_len > 0))
+            {
+                write_data(data, write_overlapped, data->descriptors.descriptors, data->descriptors.descriptors_len);
+            }
+        }
+        buffer += to_write;
+        bytes -= to_write;
+
+        if (bytes == 0)
+        {
+            /* Nothing more to write */
+            return;
+        }
+    }
+    write_data(data, write_overlapped, buffer, bytes);
 }
 
 DWORD WINAPI read_thread(LPVOID param)
@@ -231,7 +272,6 @@ DWORD WINAPI read_thread(LPVOID param)
     for (; data->process == TRUE;)
     {
         DWORD dw;
-        DWORD written;
 
         dw = WaitForMultipleObjects(table_count,
                                     table,
@@ -245,33 +285,7 @@ DWORD WINAPI read_thread(LPVOID param)
             {
                 GetOverlappedResult(data->read_handle, &read_overlapped, &read, TRUE);
                 ResetEvent(read_overlapped.hEvent);
-                /* Write data to the end of the file. */
-                write_overlapped.Offset = 0xFFFFFFFF;
-                write_overlapped.OffsetHigh = 0xFFFFFFFF;
-                if (!WriteFile(data->write_handle, buffer, read, NULL, &write_overlapped))
-                {
-                    err = GetLastError();
-                    if (err == ERROR_IO_PENDING)
-                    {
-                        if (!GetOverlappedResult(data->write_handle, &write_overlapped, &written, TRUE))
-                        {
-                            fprintf(stderr, "GetOverlappedResult() on write handle failed: %d\n", GetLastError());
-                        }
-                        else if (written != read)
-                        {
-                            fprintf(stderr, "Wrote %d bytes instead of %d. Stopping capture.\n", written, read);
-                            data->process = FALSE;
-                        }
-                    }
-                    else
-                    {
-                        /* Failed to write to output. Quit. */
-                        fprintf(stderr, "Write failed (%d). Stopping capture.\n", GetLastError());
-                        data->process = FALSE;
-                    }
-                }
-                FlushFileBuffers(data->write_handle);
-                ResetEvent(write_overlapped.hEvent);
+                process_data(data, &write_overlapped, buffer, read);
                 /* Start new read. */
                 ReadFile(data->read_handle, (PVOID)buffer, data->bufferlen, &read, &read_overlapped);
             }

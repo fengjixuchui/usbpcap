@@ -3,6 +3,8 @@
  *
  * Based on usbview sample
  *   Copyright (c) 1997-1998 Microsoft Corporation
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <windows.h>
@@ -18,6 +20,21 @@
 #include <tchar.h>
 #include "USBPcap.h"
 #include "enum.h"
+
+/*
+ * level - Tree depth level
+ * port - Port the device is attached to on hub. 0 if does not apply (root hub or device node).
+ * display - Buffer holding human-readable text describing device
+ * deviceAddress - USB address assigned to device
+ * parentAddress - USB address of parent hub, 0 if directly attached to Root Hub
+ * node - Running index of child device instance. When this is non-zero, device instance children
+ *        are being enumerated. They are enumerated to make it easy for user to determine what
+ *        the parent "USB Composite Device" is.
+ * parentNode - 0 if the node is directly under deviceAddress, otherwise a index of parent node
+ */
+typedef void (*EnumDeviceInfoCallback)(ULONG level, ULONG port, TCHAR display[MAX_DEVICE_ID_LEN],
+                                       USHORT deviceAddress, USHORT parentAddress,
+                                       ULONG node, ULONG parentNode);
 
 #define IOCTL_OUTPUT_BUFFER_SIZE 1024
 
@@ -114,7 +131,8 @@ fallback:
 static void EnumerateHub(PTSTR hub,
                          PUSB_NODE_CONNECTION_INFORMATION connection_info,
                          ULONG level,
-                         EnumerationType enumType);
+                         EnumDeviceInfoCallback callback,
+                         EnumConnectedPortCallback port_callback, void *port_ctx);
 
 static void print_indent(ULONG level)
 {
@@ -219,6 +237,55 @@ static PTSTR WideStrToMultiStr(__in LPCWSTR WideStr)
 #endif
 }
 
+void print_usbpcapcmd(ULONG level, ULONG port, TCHAR display[MAX_DEVICE_ID_LEN],
+                      USHORT deviceAddress, USHORT parentAddress,
+                      ULONG node, ULONG parentNode)
+{
+    (void)deviceAddress;
+    (void)parentAddress;
+    (void)node;
+    (void)parentNode;
+    print_indent(level + 2);
+    if (port)
+    {
+        printf("[Port %d] ", port);
+    }
+    wide_print((PWSTR)display);
+    printf("\n");
+}
+
+void print_extcap_config(ULONG level, ULONG port, TCHAR display[MAX_DEVICE_ID_LEN],
+                         USHORT deviceAddress, USHORT parentAddress,
+                         ULONG node, ULONG parentNode)
+{
+    PTSTR str = WideStrToUTF8((LPCWSTR)display);
+
+    if (node)
+    {
+        printf("value {arg=%d}{value=%d_%d}{display=%s}{enabled=false}",
+               EXTCAP_ARGNUM_MULTICHECK, deviceAddress, node, str);
+        if (parentNode)
+        {
+            printf("{parent=%d_%d}", deviceAddress, parentNode);
+        }
+        else
+        {
+            printf("{parent=%d}", deviceAddress);
+        }
+    }
+    else
+    {
+        printf("value {arg=%d}{value=%d}{display=[%d] %s}{enabled=true}",
+               EXTCAP_ARGNUM_MULTICHECK, deviceAddress, deviceAddress, str);
+        if (parentAddress)
+        {
+            printf("{parent=%d}", parentAddress);
+        }
+    }
+    printf("\n");
+    GlobalFree(str);
+}
+
 static PTSTR GetDriverKeyName(HANDLE Hub, ULONG ConnectionIndex)
 {
     BOOL                                success;
@@ -309,7 +376,7 @@ static PTSTR GetExternalHubName(HANDLE Hub, ULONG ConnectionIndex)
 {
     BOOL                        success;
     ULONG                       nBytes;
-    USB_NODE_CONNECTION_NAME	extHubName;
+    USB_NODE_CONNECTION_NAME    extHubName;
     PUSB_NODE_CONNECTION_NAME   extHubNameW;
     PTSTR                       extHubNameA;
 
@@ -458,7 +525,7 @@ static BOOL stack_push(Stack **stack, USHORT value)
 
 
 static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
-                                 USHORT deviceAddress, EnumerationType enumType)
+                                 USHORT deviceAddress, EnumDeviceInfoCallback callback)
 {
     DEVINST    current;
     DEVINST    next;
@@ -490,10 +557,7 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
     {
         if ((++sanityCounter) > LOOP_SANITY_LIMIT)
         {
-            if (enumType != ENUMERATE_EXTCAP)
-            {
-                fprintf(stderr, "Sanity check failed in PrintDevinstChildren()\n");
-            }
+            fprintf(stderr, "Sanity check failed in PrintDevinstChildren()\n");
             return;
         }
         len = sizeof(buf) / sizeof(buf[0]);
@@ -518,28 +582,11 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
 
         if (cr == CR_SUCCESS && (((PWSTR)buf)[0] != L'\0'))
         {
-            if (enumType == ENUMERATE_USBPCAPCMD)
+            if (!stack_peek(&nodeStack, &parentNode))
             {
-                print_indent(level);
-                wide_print((PWSTR)buf);
-                printf("\n");
+                parentNode = 0;
             }
-            else if (enumType == ENUMERATE_EXTCAP)
-            {
-                PTSTR str = WideStrToUTF8((LPCWSTR)buf);
-                printf("value {arg=%d}{value=%d_%d}{display=%s}{enabled=false}",
-                       EXTCAP_ARGNUM_MULTICHECK, deviceAddress, nextNode,
-                       str);
-                GlobalFree(str);
-                if ((TRUE == stack_peek(&nodeStack, &parentNode)) && parentNode != 0)
-                {
-                    printf("{parent=%d_%d}\n", deviceAddress, parentNode);
-                }
-                else
-                {
-                    printf("{parent=%d}\n", deviceAddress);
-                }
-            }
+            callback(level, 0, buf, deviceAddress, deviceAddress, nextNode, parentNode);
         }
 
         // Go down a level to the first next.
@@ -592,10 +639,7 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
             }
             else
             {
-                if (enumType != ENUMERATE_EXTCAP)
-                {
-                    fprintf(stderr, "CM_Get_Sibling() returned 0x%08X\n", cr);
-                }
+                fprintf(stderr, "CM_Get_Sibling() returned 0x%08X\n", cr);
                 return;
             }
         }
@@ -604,7 +648,8 @@ static VOID PrintDevinstChildren(DEVINST parent, ULONG indent,
 
 VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
                      ULONG Level, BOOLEAN PrintAllChildren,
-                     USHORT deviceAddress, USHORT parentAddress, EnumerationType enumType)
+                     USHORT deviceAddress, USHORT parentAddress,
+                     EnumDeviceInfoCallback callback)
 {
     DEVINST    devInst;
     DEVINST    devInstNext;
@@ -631,10 +676,7 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
     {
         if ((++sanityOuter) > LOOP_SANITY_LIMIT)
         {
-            if (enumType != ENUMERATE_EXTCAP)
-            {
-                fprintf(stderr, "Sanity check failed in PrintDeviceDesc() outer loop!\n");
-            }
+            fprintf(stderr, "Sanity check failed in PrintDeviceDesc() outer loop!\n");
             return;
         }
         // Get the DriverName value
@@ -663,30 +705,10 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
 
                 if (cr == CR_SUCCESS)
                 {
-                    if (enumType == ENUMERATE_USBPCAPCMD)
-                    {
-                        print_indent(Level);
-                        printf("[Port %d] ", Index);
-                        wide_print((PWSTR)buf);
-                        printf("\n");
-                    }
-                    else if (enumType == ENUMERATE_EXTCAP)
-                    {
-                        PTSTR str = WideStrToUTF8((LPCWSTR)buf);
-                        printf("value {arg=%d}{value=%d}{display=[%d] %s}{enabled=true}",
-                               EXTCAP_ARGNUM_MULTICHECK,
-                               deviceAddress, deviceAddress, str);
-                        if (parentAddress != 0)
-                        {
-                            printf("{parent=%d}", parentAddress);
-                        }
-                        printf("\n");
-                        GlobalFree(str);
-                    }
-
+                    callback(Level, Index, buf, deviceAddress, parentAddress, 0, 0);
                     if (PrintAllChildren)
                     {
-                        PrintDevinstChildren(devInst, Level, deviceAddress, enumType);
+                        PrintDevinstChildren(devInst, Level, deviceAddress, callback);
                     }
                 }
 
@@ -700,10 +722,7 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
         }
         else
         {
-            if (enumType != ENUMERATE_EXTCAP)
-            {
-                fprintf(stderr, "Failed to get CM_DRP_DRIVER: 0x%08X\n", cr);
-            }
+            fprintf(stderr, "Failed to get CM_DRP_DRIVER: 0x%08X\n", cr);
             return;
         }
 
@@ -725,10 +744,7 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
         {
             if ((++sanityInner) > LOOP_SANITY_LIMIT)
             {
-                if (enumType != ENUMERATE_EXTCAP)
-                {
-                    fprintf(stderr, "Sanity check failed in PrintDeviceDesc() inner loop!\n");
-                }
+                fprintf(stderr, "Sanity check failed in PrintDeviceDesc() inner loop!\n");
                 return;
             }
 
@@ -756,10 +772,7 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
             }
             else
             {
-                if (enumType != ENUMERATE_EXTCAP)
-                {
-                    fprintf(stderr, "CM_Get_Sibling() returned 0x%08X\n", cr);
-                }
+                fprintf(stderr, "CM_Get_Sibling() returned 0x%08X\n", cr);
                 return;
             }
         }
@@ -768,7 +781,8 @@ VOID PrintDeviceDesc(__in PCTSTR DriverName, ULONG Index,
 
 static VOID
 EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
-                  USHORT hubAddress, EnumerationType enumType)
+                  USHORT hubAddress, EnumDeviceInfoCallback print_callback,
+                  EnumConnectedPortCallback port_callback, void *port_ctx)
 {
     ULONG       index;
     BOOL        success;
@@ -803,18 +817,27 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
         // If there is a device connected, get the Device Description
         if (connectionInfo.ConnectionStatus != NoDeviceConnected)
         {
-            driverKeyName = GetDriverKeyName(hHubDevice,
-                                             index);
-
-            if (driverKeyName)
+            if (print_callback)
             {
-                PrintDeviceDesc(driverKeyName, index, level,
-                                !connectionInfo.DeviceIsHub,
-                                connectionInfo.DeviceAddress,
-                                hubAddress,
-                                enumType);
+                driverKeyName = GetDriverKeyName(hHubDevice,
+                                                 index);
 
-                GlobalFree(driverKeyName);
+                if (driverKeyName)
+                {
+                    PrintDeviceDesc(driverKeyName, index, level,
+                                    !connectionInfo.DeviceIsHub,
+                                    connectionInfo.DeviceAddress,
+                                    hubAddress,
+                                    print_callback);
+
+                    GlobalFree(driverKeyName);
+                }
+            }
+
+            if ((connectionInfo.ConnectionStatus == DeviceConnected) && port_callback)
+            {
+                port_callback(hHubDevice, index, connectionInfo.DeviceAddress,
+                              &connectionInfo.DeviceDescriptor, port_ctx);
             }
 
             // If the device connected to the port is an external hub, get the
@@ -831,7 +854,9 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
                     EnumerateHub(extHubName,
                                  &connectionInfo,
                                  level+1,
-                                 enumType);
+                                 print_callback,
+                                 port_callback,
+                                 port_ctx);
                     GlobalFree(extHubName);
                 }
             }
@@ -843,7 +868,8 @@ EnumerateHubPorts(HANDLE hHubDevice, UCHAR NumPorts, ULONG level,
 static void EnumerateHub(PTSTR hub,
                          PUSB_NODE_CONNECTION_INFORMATION connection_info,
                          ULONG level,
-                         EnumerationType enumType)
+                         EnumDeviceInfoCallback print_callback,
+                         EnumConnectedPortCallback port_callback, void *port_ctx)
 {
     PUSB_NODE_INFORMATION   hubInfo;
     HANDLE                  hHubDevice;
@@ -933,7 +959,7 @@ static void EnumerateHub(PTSTR hub,
                       hubInfo->u.HubInformation.HubDescriptor.bNumberOfPorts,
                       level,
                       (connection_info == NULL) ? 0 : connection_info->DeviceAddress,
-                      enumType);
+                      print_callback, port_callback, port_ctx);
 
 EnumerateHubError:
     // Clean up any stuff that got allocated
@@ -997,7 +1023,7 @@ get_usbpcap_filter_hub_symlink(const char *filter,
     return bytes_ret;
 }
 
-void enumerate_attached_devices(const char *filter, EnumerationType enumType)
+void enumerate_print_usbpcap_interactive(const char *filter)
 {
     WCHAR  outBuf[IOCTL_OUTPUT_BUFFER_SIZE];
     DWORD  bytes_ret;
@@ -1007,16 +1033,44 @@ void enumerate_attached_devices(const char *filter, EnumerationType enumType)
     {
         PTSTR str;
 
-        if (enumType == ENUMERATE_USBPCAPCMD)
-        {
-            printf("  ");
-            wide_print(outBuf);
-            printf("\n");
-        }
+        printf("  ");
+        wide_print(outBuf);
+        printf("\n");
 
         str = WideStrToMultiStr(outBuf);
-        EnumerateHub(str, NULL, 2, enumType);
+        EnumerateHub(str, NULL, 0, print_usbpcapcmd, NULL, NULL);
         GlobalFree(str);
     }
 }
 
+void enumerate_print_extcap_config(const char *filter)
+{
+    WCHAR  outBuf[IOCTL_OUTPUT_BUFFER_SIZE];
+    DWORD  bytes_ret;
+
+    bytes_ret = get_usbpcap_filter_hub_symlink(filter, &outBuf[0], sizeof(outBuf)/sizeof(outBuf[0]));
+    if (bytes_ret > 0)
+    {
+        PTSTR str;
+
+        str = WideStrToMultiStr(outBuf);
+        EnumerateHub(str, NULL, 0, print_extcap_config, NULL, NULL);
+        GlobalFree(str);
+    }
+}
+
+void enumerate_all_connected_devices(const char *filter, EnumConnectedPortCallback cb, void *ctx)
+{
+    WCHAR  outBuf[IOCTL_OUTPUT_BUFFER_SIZE];
+    DWORD  bytes_ret;
+
+    bytes_ret = get_usbpcap_filter_hub_symlink(filter, &outBuf[0], sizeof(outBuf)/sizeof(outBuf[0]));
+    if (bytes_ret > 0)
+    {
+        PTSTR str;
+
+        str = WideStrToMultiStr(outBuf);
+        EnumerateHub(str, NULL, 0, NULL, cb, ctx);
+        GlobalFree(str);
+    }
+}

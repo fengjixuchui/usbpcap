@@ -1,17 +1,7 @@
 /*
- *  Copyright (c) 2013 Tomasz Moń <desowin@gmail.com>
+ * Copyright (c) 2013-2019 Tomasz Moń <desowin@gmail.com>
  *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; under version 2 of the License.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses>.
+ * SPDX-License-Identifier: GPL-2.0
  */
 
 #define INITGUID
@@ -914,6 +904,12 @@ BOOLEAN USBPcapIsDeviceRootHub(PDEVICE_OBJECT device)
             found = TRUE;
             break;
         }
+        else if (wcscmp(hardwareIds[id], L"USB\\ROOT_HUB30") == 0)
+        {
+            DkDbgStr("Device is USB\\ROOT_HUB30");
+            found = TRUE;
+            break;
+        }
         else if (IsHwidNonStandardRootHub(hardwareIds[id]) == TRUE)
         {
             DkDbgStr("Device HWID is in NonStandardHWIDs list");
@@ -1029,3 +1025,20 @@ BOOLEAN USBPcapSetDeviceFiltered(PUSBPCAP_ADDRESS_FILTER filter, int address)
     return TRUE;
 }
 
+LARGE_INTEGER USBPcapGetCurrentTimestamp(VOID)
+{
+    LARGE_INTEGER  timestamp;
+
+#if (NTDDI_VERSION <= NTDDI_WIN7)
+    /*
+     * Updated approximately every ten milliseconds.
+     *
+     * TODO: Get higer precision timestamp.
+     */
+    KeQuerySystemTime(&timestamp);
+#else
+    KeQuerySystemTimePrecise(&timestamp);
+#endif
+
+    return timestamp;
+}

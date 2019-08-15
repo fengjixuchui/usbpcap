@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2013-2019 Tomasz Moń <desowin@gmail.com>
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ */
+
 #include "USBPcapMain.h"
 #include "USBPcapHelperFunctions.h"
 #include "USBPcapTables.h"
@@ -46,6 +52,12 @@ static void USBPcapFreeDeviceData(IN PDEVICE_EXTENSION pDevExt)
         {
             USBPcapFreeEndpointTable(pDeviceData->endpointTable);
             pDeviceData->endpointTable = NULL;
+        }
+
+        if (pDeviceData->URBIrpTable != NULL)
+        {
+            USBPcapFreeURBIRPInfoTable(pDeviceData->URBIrpTable);
+            pDeviceData->URBIrpTable = NULL;
         }
 
         if (pDeviceData->previousChildren != NULL)
@@ -149,8 +161,9 @@ static NTSTATUS USBPcapAllocateDeviceData(IN PDEVICE_EXTENSION pDevExt,
             }
         }
 
-        KeInitializeSpinLock(&pDeviceData->endpointTableSpinLock);
+        KeInitializeSpinLock(&pDeviceData->tablesSpinLock);
         pDeviceData->endpointTable = USBPcapInitializeEndpointTable(NULL);
+        pDeviceData->URBIrpTable = USBPcapInitializeURBIRPInfoTable(NULL);
 
         pDeviceData->descriptor = NULL;
     }

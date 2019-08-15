@@ -3,6 +3,8 @@
  *
  * Based on devcon sample
  *   Copyright (c) Microsoft Corporation
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <windows.h>
@@ -71,6 +73,10 @@ static BOOL is_standard_hwid(LPTSTR hwid)
         return TRUE;
     }
     else if (_tcscmp("USB\\ROOT_HUB20", hwid) == 0)
+    {
+        return TRUE;
+    }
+    else if (_tcscmp("USB\\ROOT_HUB30", hwid) == 0)
     {
         return TRUE;
     }
@@ -283,7 +289,6 @@ void find_non_standard_hwids(HDEVINFO devs,
     LPTSTR *tmpIds = NULL;
     CONFIGRET cr;
     DEVINST roothub;
-    ULONG hwidType;
 
     /* Assume that all host controller children are Root Hubs */
     cr = CM_Get_Child(&roothub, devInfo->DevInst, 0);

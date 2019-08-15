@@ -1,17 +1,7 @@
 /*
- *  Copyright (c) 2013 Tomasz Moń <desowin@gmail.com>
+ * Copyright (c) 2013-2019 Tomasz Moń <desowin@gmail.com>
  *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; under version 2 of the License.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses>.
+ * SPDX-License-Identifier: GPL-2.0
  */
 
 #ifndef USBPCAP_TABLES_H
@@ -44,5 +34,30 @@ PRTL_GENERIC_TABLE USBPcapInitializeEndpointTable(IN PVOID context);
 BOOLEAN USBPcapRetrieveEndpointInfo(IN PUSBPCAP_DEVICE_DATA pDeviceData,
                                     IN USBD_PIPE_HANDLE handle,
                                     PUSBPCAP_ENDPOINT_INFO pInfo);
+
+typedef struct _USBPCAP_URB_IRP_INFO
+{
+    /* IRP pointer is used as a key */
+    PIRP          irp;
+    /* Data collected when the URB was travelling from FDO to PDO */
+    LARGE_INTEGER timestamp;
+    USBD_STATUS   status;
+    USHORT        function;
+    UCHAR         info;      /* I/O Request info */
+    USHORT        bus;       /* bus (RootHub) number */
+    USHORT        device;    /* device address */
+} USBPCAP_URB_IRP_INFO, *PUSBPCAP_URB_IRP_INFO;
+
+VOID USBPcapRemoveURBIRPInfo(IN PRTL_GENERIC_TABLE table,
+                             IN PIRP irp);
+VOID USBPcapAddURBIRPInfo(IN PRTL_GENERIC_TABLE table,
+                          IN PUSBPCAP_URB_IRP_INFO irpinfo);
+
+VOID USBPcapFreeURBIRPInfoTable(IN PRTL_GENERIC_TABLE table);
+PRTL_GENERIC_TABLE USBPcapInitializeURBIRPInfoTable(IN PVOID context);
+
+BOOLEAN USBPcapObtainURBIRPInfo(IN PUSBPCAP_DEVICE_DATA pDeviceData,
+                                IN PIRP irp,
+                                PUSBPCAP_URB_IRP_INFO pInfo);
 
 #endif /* USBPCAP_TABLES_H */

@@ -1,44 +1,14 @@
 /*
- *  Copyright (c) 2013 Tomasz Moń <desowin@gmail.com>
+ * Copyright (c) 2013-2019 Tomasz Moń <desowin@gmail.com>
  *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; under version 2 of the License.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses>.
+ * SPDX-License-Identifier: GPL-2.0
  */
 
 #include "USBPcapMain.h"
 #include "USBPcapBuffer.h"
+#include "USBPcapHelperFunctions.h"
 
 #define USBPCAP_BUFFER_TAG  (ULONG)'ffuB'
-/* USB packets, beginning with a USBPcap header */
-#define DLT_USBPCAP         249
-
-#pragma pack(1)
-typedef struct pcap_hdr_s {
-    UINT32 magic_number;   /* magic number */
-    UINT16 version_major;  /* major version number */
-    UINT16 version_minor;  /* minor version number */
-    INT32  thiszone;       /* GMT to local correction */
-    UINT32 sigfigs;        /* accuracy of timestamps */
-    UINT32 snaplen;        /* max length of captured packets, in octets */
-    UINT32 network;        /* data link type */
-} pcap_hdr_t;
-
-#pragma pack(1)
-typedef struct pcaprec_hdr_s {
-    UINT32 ts_sec;         /* timestamp seconds */
-    UINT32 ts_usec;        /* timestamp microseconds */
-    UINT32 incl_len;       /* number of octets of packet saved in file */
-    UINT32 orig_len;       /* actual length of packet */
-} pcaprec_hdr_t;
 
 __inline static UINT32
 USBPcapGetBufferFree(PUSBPCAP_ROOTHUB_DATA pData)
@@ -485,27 +455,70 @@ NTSTATUS USBPcapBufferHandleReadIrp(PIRP pIrp,
     return STATUS_SUCCESS;
 }
 
+static void USBPcapBufferCompletePendedReadIrp(PUSBPCAP_ROOTHUB_DATA pRootData)
+{
+    PDEVICE_EXTENSION  pControlExt;
+    PIRP               pIrp = NULL;
+
+    pControlExt = (PDEVICE_EXTENSION)pRootData->controlDevice->DeviceExtension;
+
+    ASSERT(pControlExt->deviceMagic == USBPCAP_MAGIC_CONTROL);
+
+    pIrp = IoCsqRemoveNextIrp(&pControlExt->context.control.ioCsq,
+                                  NULL);
+    if (pIrp != NULL)
+    {
+        PVOID   buffer;
+        UINT32  bufferLength;
+        UINT32  bytes;
+
+        /*
+         * Only IRPs with non-zero buffer are being queued.
+         *
+         * Since control device has DO_DIRECT_IO bit set the MDL is already
+         * probed and locked
+         */
+        buffer = MmGetSystemAddressForMdlSafe(pIrp->MdlAddress,
+                                              NormalPagePriority);
+
+        if (buffer == NULL)
+        {
+            pIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            bytes = 0;
+        }
+        else
+        {
+            UINT32 bufferLength = MmGetMdlByteCount(pIrp->MdlAddress);
+
+            if (bufferLength != 0)
+            {
+                KIRQL  irql;
+                KeAcquireSpinLock(&pRootData->bufferLock, &irql);
+                bytes = USBPcapBufferRead(pRootData,
+                                          buffer, bufferLength);
+                KeReleaseSpinLock(&pRootData->bufferLock, irql);
+            }
+            else
+            {
+                bytes = 0;
+            }
+
+            pIrp->IoStatus.Status = STATUS_SUCCESS;
+        }
+
+        pIrp->IoStatus.Information = (ULONG_PTR) bytes;
+        IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+    }
+}
 
 __inline static VOID
 USBPcapInitializePcapHeader(PUSBPCAP_ROOTHUB_DATA pData,
+                            LARGE_INTEGER timestamp,
                             pcaprec_hdr_t *pcapHeader,
                             UINT32 bytes)
 {
-    LARGE_INTEGER  time;
-
-#if (NTDDI_VERSION <= NTDDI_WIN7)
-    /*
-     * Updated approximately every ten milliseconds.
-     *
-     * TODO: Get higer precision timestamp.
-     */
-    KeQuerySystemTime(&time);
-#else
-    KeQuerySystemTimePrecise(&time);
-#endif
-
-    pcapHeader->ts_sec = (UINT32)(time.QuadPart/10000000-11644473600);
-    pcapHeader->ts_usec = (UINT32)((time.QuadPart%10000000)/10);
+    pcapHeader->ts_sec = (UINT32)(timestamp.QuadPart/10000000-11644473600);
+    pcapHeader->ts_usec = (UINT32)((timestamp.QuadPart%10000000)/10);
 
     /* Obey the snaplen limit */
     if (bytes > pData->snaplen)
@@ -519,41 +532,45 @@ USBPcapInitializePcapHeader(PUSBPCAP_ROOTHUB_DATA pData,
     pcapHeader->orig_len = bytes;
 }
 
-NTSTATUS USBPcapBufferWritePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
-                                  PUSBPCAP_BUFFER_PACKET_HEADER header,
-                                  PVOID buffer)
+/* Caller must hold bufferLock
+ *
+ * payloadEntries is array of USBPCAP_PAYLOAD_ENTRY with the last element being {0, NULL}
+ */
+static NTSTATUS
+USBPcapBufferStorePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
+                         LARGE_INTEGER timestamp,
+                         PUSBPCAP_BUFFER_PACKET_HEADER header,
+                         PUSBPCAP_PAYLOAD_ENTRY payloadEntries)
 {
     UINT32             bytes;
     UINT32             bytesFree;
-    KIRQL              irql;
-    NTSTATUS           status;
-    PDEVICE_EXTENSION  pControlExt;
-    PIRP               pIrp = NULL;
+    UINT32             tmp;
     pcaprec_hdr_t      pcapHeader;
-
-    pControlExt = (PDEVICE_EXTENSION)pRootData->controlDevice->DeviceExtension;
-
-    ASSERT(pControlExt->deviceMagic == USBPCAP_MAGIC_CONTROL);
+    int                i;
 
     bytes = header->headerLen + header->dataLength;
 
-    KeAcquireSpinLock(&pRootData->bufferLock, &irql);
-
-    USBPcapInitializePcapHeader(pRootData, &pcapHeader, bytes);
+    USBPcapInitializePcapHeader(pRootData, timestamp, &pcapHeader, bytes);
 
     /* pcapHeader.incl_len contains the number of bytes to write */
     bytes = pcapHeader.incl_len;
 
-    /* Sanity check buffer */
-    if ((bytes > sizeof(pcaprec_hdr_t) + header->headerLen) &&
-        buffer == NULL)
+    /* Sanity check payload entries */
+    if (bytes > (sizeof(pcaprec_hdr_t) + header->headerLen))
     {
-        DkDbgStr("Attempted to write invalid packet.");
-        KeReleaseSpinLock(&pRootData->bufferLock, irql);
-        return STATUS_INVALID_PARAMETER;
-    }
+        UINT32 bytesMissing = bytes - (sizeof(pcaprec_hdr_t) + header->headerLen);
 
-    status = STATUS_SUCCESS;
+        for (i = 0; (bytesMissing > 0) && (payloadEntries[i].buffer); i++)
+        {
+            bytesMissing -= min(payloadEntries[i].size, bytesMissing);
+        }
+        if (bytesMissing > 0)
+        {
+            DkDbgVal("Attempted to write invalid packet. Missing %d bytes of payload.",
+                     bytesMissing);
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
 
     bytesFree = USBPcapGetBufferFree(pRootData);
 
@@ -562,85 +579,87 @@ NTSTATUS USBPcapBufferWritePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
         ((bytesFree - sizeof(pcaprec_hdr_t)) < bytes))
     {
         DkDbgStr("No enough free space left.");
-        status = STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
-    else
+
+    /* Write Packet Header */
+    USBPcapBufferWriteUnsafe(pRootData,
+                             (PVOID) &pcapHeader,
+                             (UINT32) sizeof(pcaprec_hdr_t));
+
+    /* Write USBPCAP_BUFFER_PACKET_HEADER */
+    tmp = min(bytes, (UINT32)header->headerLen);
+    if (tmp > 0)
     {
-        UINT32 tmp;
-
-        /* Write Packet Header */
         USBPcapBufferWriteUnsafe(pRootData,
-                                 (PVOID) &pcapHeader,
-                                 (UINT32) sizeof(pcaprec_hdr_t));
+                                 (PVOID) header,
+                                 tmp);
+    }
+    bytes -= tmp;
 
-        /* Write USBPCAP_BUFFER_PACKET_HEADER */
-        tmp = min(bytes, (UINT32)header->headerLen);
+    /* Write payload entries */
+    for (i = 0; (bytes > 0) && (payloadEntries[i].buffer); i++)
+    {
+        tmp = min(bytes, payloadEntries[i].size);
         if (tmp > 0)
         {
             USBPcapBufferWriteUnsafe(pRootData,
-                                     (PVOID) header,
+                                     payloadEntries[i].buffer,
                                      tmp);
         }
         bytes -= tmp;
-
-        if (buffer != NULL && bytes > 0 && header->dataLength > 0)
-        {
-            /* Write data */
-            tmp = min(bytes, header->dataLength);
-            USBPcapBufferWriteUnsafe(pRootData,
-                                     buffer,
-                                     tmp);
-        }
     }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS USBPcapBufferWriteTimestampedPayload(PUSBPCAP_ROOTHUB_DATA pRootData,
+                                              LARGE_INTEGER timestamp,
+                                              PUSBPCAP_BUFFER_PACKET_HEADER header,
+                                              PUSBPCAP_PAYLOAD_ENTRY payload)
+{
+    KIRQL                  irql;
+    NTSTATUS               status;
+
+    KeAcquireSpinLock(&pRootData->bufferLock, &irql);
+    status = USBPcapBufferStorePacket(pRootData, timestamp, header, payload);
     KeReleaseSpinLock(&pRootData->bufferLock, irql);
 
     if (NT_SUCCESS(status))
     {
-        pIrp = IoCsqRemoveNextIrp(&pControlExt->context.control.ioCsq,
-                                  NULL);
-        if (pIrp != NULL)
-        {
-            PVOID   buffer;
-            UINT32  bufferLength;
-            UINT32  bytesRead;
-
-            /*
-             * Only IRPs with non-zero buffer are being queued.
-             *
-             * Since control device has DO_DIRECT_IO bit set the MDL is already
-             * probed and locked
-             */
-            buffer = MmGetSystemAddressForMdlSafe(pIrp->MdlAddress,
-                                                  NormalPagePriority);
-
-            if (buffer == NULL)
-            {
-                pIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-                bytes = 0;
-            }
-            else
-            {
-                UINT32 bufferLength = MmGetMdlByteCount(pIrp->MdlAddress);
-
-                if (bufferLength != 0)
-                {
-                    KeAcquireSpinLock(&pRootData->bufferLock, &irql);
-                    bytes = USBPcapBufferRead(pRootData,
-                                              buffer, bufferLength);
-                    KeReleaseSpinLock(&pRootData->bufferLock, irql);
-                }
-                else
-                {
-                    bytes = 0;
-                }
-
-                pIrp->IoStatus.Status = STATUS_SUCCESS;
-            }
-
-            pIrp->IoStatus.Information = (ULONG_PTR) bytes;
-            IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-        }
+        USBPcapBufferCompletePendedReadIrp(pRootData);
     }
 
     return status;
+}
+
+NTSTATUS USBPcapBufferWritePayload(PUSBPCAP_ROOTHUB_DATA pRootData,
+                                   PUSBPCAP_BUFFER_PACKET_HEADER header,
+                                   PUSBPCAP_PAYLOAD_ENTRY payload)
+{
+    LARGE_INTEGER timestamp = USBPcapGetCurrentTimestamp();
+    return USBPcapBufferWriteTimestampedPayload(pRootData, timestamp, header, payload);
+}
+
+NTSTATUS USBPcapBufferWriteTimestampedPacket(PUSBPCAP_ROOTHUB_DATA pRootData,
+                                             LARGE_INTEGER timestamp,
+                                             PUSBPCAP_BUFFER_PACKET_HEADER header,
+                                             PVOID buffer)
+{
+    USBPCAP_PAYLOAD_ENTRY  payload[2];
+
+    payload[0].size   = header->dataLength;
+    payload[0].buffer = buffer;
+    payload[1].size   = 0;
+    payload[1].buffer = NULL;
+
+    return USBPcapBufferWriteTimestampedPayload(pRootData, timestamp, header, payload);
+}
+
+NTSTATUS USBPcapBufferWritePacket(PUSBPCAP_ROOTHUB_DATA pRootData,
+                                  PUSBPCAP_BUFFER_PACKET_HEADER header,
+                                  PVOID buffer)
+{
+    LARGE_INTEGER timestamp = USBPcapGetCurrentTimestamp();
+    return USBPcapBufferWriteTimestampedPacket(pRootData, timestamp, header, buffer);
 }
